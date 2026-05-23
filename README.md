@@ -1187,6 +1187,13 @@
             ]
         };
 
+        // We explicitly track listeners so we don't accidentally remove global ones
+        let activeCallValueListener = null;
+        let iceCallerListener = null;
+        let iceCalleeListener = null;
+        let globalCallListenerRef = null;
+        let globalCallListenerCb = null;
+
         // Synthesize dialing/incoming sounds dynamically via Web Audio API (extremely premium)
         let ringbackInterval = null;
         let ringerInterval = null;
@@ -1284,6 +1291,11 @@
             document.getElementById('active-call-name').innerText = myRole === 'admin' ? document.getElementById('session-c-name').innerText : 'HQ Dispatch';
             document.getElementById('active-call-status').innerText = 'Calling...';
 
+            document.getElementById('btn-toggle-mic').innerHTML = '<i class="fas fa-microphone"></i>';
+            document.getElementById('btn-toggle-mic').style.background = 'rgba(255,255,255,0.2)';
+            document.getElementById('btn-toggle-cam').innerHTML = '<i class="fas fa-video"></i>';
+            document.getElementById('btn-toggle-cam').style.background = 'rgba(255,255,255,0.2)';
+
             if(type === 'audio') document.getElementById('local-video').style.display = 'none';
             else document.getElementById('local-video').style.display = 'block';
 
@@ -1326,8 +1338,8 @@
                 await RTC.pc.setLocalDescription(offer);
                 RTC.callRef.update({ offer: { type: offer.type, sdp: offer.sdp } });
 
-                // Listen for Answer
-                RTC.callRef.on('value', snap => {
+                // Set up safely scoped active listener
+                activeCallValueListener = snap => {
                     const data = snap.val();
                     if(!data) {
                         endCallLocal(); // Call hung up or rejected
@@ -1342,12 +1354,14 @@
                         showToast("Call declined.", "error");
                         endCallLocal();
                     }
-                });
+                };
+                RTC.callRef.on('value', activeCallValueListener);
 
-                // Listen for Callee ICE
-                RTC.callRef.child('iceCandidates/callee').on('child_added', snap => {
-                    if(snap.val()) RTC.pc.addIceCandidate(new RTCIceCandidate(snap.val()));
-                });
+                // Listen for Callee ICE safely
+                iceCalleeListener = snap => {
+                    if(snap.val() && RTC.pc) RTC.pc.addIceCandidate(new RTCIceCandidate(snap.val()));
+                };
+                RTC.callRef.child('iceCandidates/callee').on('child_added', iceCalleeListener);
 
             } catch (e) {
                 console.error(e);
@@ -1360,22 +1374,29 @@
             const targetPhone = myRole === 'admin' ? currentAdminTargetPhone : currentClientPhone;
             if(!targetPhone) return;
 
-            db.ref(`trackings/${targetPhone}/call`).on('value', snap => {
+            if (globalCallListenerRef && globalCallListenerCb) {
+                globalCallListenerRef.off('value', globalCallListenerCb);
+            }
+
+            globalCallListenerRef = db.ref(`trackings/${targetPhone}/call`);
+            globalCallListenerCb = snap => {
                 const data = snap.val();
-                if(data && data.status === 'ringing' && data.caller !== myRole) {
-                    // Incoming call
+                
+                if(data && data.status === 'ringing' && data.caller !== myRole && !RTC.pc) {
                     playRingtone();
                     document.getElementById('incoming-call-name').innerText = data.caller === 'admin' ? 'HQ Dispatch' : (document.getElementById('session-c-name')?.innerText || 'Client');
                     document.getElementById('incoming-call-overlay').classList.add('active');
-                    
                     window.incomingCallData = { offer: data.offer, type: data.type, role: myRole, targetPhone: targetPhone };
                 }
-                if(!data) {
-                    // Call ended or rejected
+                
+                if(!data || data.status === 'declined') {
+                    stopRingtone();
                     document.getElementById('incoming-call-overlay').classList.remove('active');
-                    if(RTC.pc) endCallLocal();
+                    window.incomingCallData = null;
+                    if(RTC.pc && !RTC.isCaller) endCallLocal();
                 }
-            });
+            };
+            globalCallListenerRef.on('value', globalCallListenerCb);
         }
 
         async function acceptCall() {
@@ -1392,6 +1413,11 @@
             document.getElementById('active-call-overlay').style.display = 'flex';
             document.getElementById('active-call-name').innerText = data.role === 'admin' ? document.getElementById('session-c-name').innerText : 'HQ Dispatch';
             document.getElementById('active-call-status').innerText = 'Connecting...';
+
+            document.getElementById('btn-toggle-mic').innerHTML = '<i class="fas fa-microphone"></i>';
+            document.getElementById('btn-toggle-mic').style.background = 'rgba(255,255,255,0.2)';
+            document.getElementById('btn-toggle-cam').innerHTML = '<i class="fas fa-video"></i>';
+            document.getElementById('btn-toggle-cam').style.background = 'rgba(255,255,255,0.2)';
 
             if(data.type === 'audio') document.getElementById('local-video').style.display = 'none';
             else document.getElementById('local-video').style.display = 'block';
@@ -1428,10 +1454,11 @@
                     status: 'answered'
                 });
 
-                // Listen for Caller ICE
-                RTC.callRef.child('iceCandidates/caller').on('child_added', snap => {
-                    if(snap.val()) RTC.pc.addIceCandidate(new RTCIceCandidate(snap.val()));
-                });
+                // Listen for Caller ICE safely
+                iceCallerListener = snap => {
+                    if(snap.val() && RTC.pc) RTC.pc.addIceCandidate(new RTCIceCandidate(snap.val()));
+                };
+                RTC.callRef.child('iceCandidates/caller').on('child_added', iceCallerListener);
 
             } catch (e) {
                 console.error(e);
@@ -1460,13 +1487,43 @@
         function endCallLocal() {
             stopRingbackTone();
             stopRingtone();
-            if(RTC.pc) { RTC.pc.close(); RTC.pc = null; }
-            if(RTC.localStream) { RTC.localStream.getTracks().forEach(t => t.stop()); RTC.localStream = null; }
+            
+            if (RTC.pc) { 
+                RTC.pc.ontrack = null;
+                RTC.pc.onicecandidate = null;
+                RTC.pc.close(); 
+                RTC.pc = null; 
+            }
+            if (RTC.localStream) { 
+                RTC.localStream.getTracks().forEach(t => t.stop()); 
+                RTC.localStream = null; 
+            }
+            
             document.getElementById('active-call-overlay').style.display = 'none';
             document.getElementById('local-video').srcObject = null;
             document.getElementById('remote-video').srcObject = null;
-            if(RTC.callRef) { RTC.callRef.off(); RTC.callRef = null; }
             document.getElementById('active-call-status').innerText = '';
+
+            // Clean up ONLY the active call listeners, preserving the global incoming listener!
+            if (RTC.targetPhone) {
+                const callRef = db.ref(`trackings/${RTC.targetPhone}/call`);
+                if (activeCallValueListener) {
+                    callRef.off('value', activeCallValueListener);
+                    activeCallValueListener = null;
+                }
+                if (iceCallerListener) {
+                    callRef.child('iceCandidates/caller').off('child_added', iceCallerListener);
+                    iceCallerListener = null;
+                }
+                if (iceCalleeListener) {
+                    callRef.child('iceCandidates/callee').off('child_added', iceCalleeListener);
+                    iceCalleeListener = null;
+                }
+            }
+            
+            RTC.callRef = null;
+            RTC.isCaller = false;
+            window.incomingCallData = null;
         }
 
         function toggleMic() {
